@@ -210,6 +210,414 @@ agent/conversation_loop.py
                 LLM API
 ```
 
+#### 3. 真正重要的地方：run_conversation()
+现在进入：
+> agent/conversation_loop.py
+
+这个文件目前已经有 1807 行，说明 Hermes 把 Agent Loop 做得非常复杂了。官方源码顶部也直接说明：
+
+run_conversation(agent, ...)
+
+负责：
+
+```text
+model call
+tool dispatch
+retries
+fallbacks
+compression
+post-turn hooks
+```
+
+但我们绝对不要从第一行开始读 1800 行。
+
+这是源码学习的大忌。
+
+我们只找：
+```text
+def run_conversation(...)
+```
+![img_4.png](img_4.png)
+
+
+然后围绕这个方法建立调用链。
+
+
+#### 4. 第一个非常关键的事实
+官方当前 Agent Loop 文档直接给出了一个 turn【轮次】 的生命周期：
+```text
+run_conversation()
+
+    ↓
+
+1. Generate task_id 生成任务编号
+
+    ↓
+
+2. Append user message 追加用户消息
+
+    ↓
+
+3. Build / reuse system prompt
+
+    ↓
+
+4. Check context compression 检查上下文压缩情况
+
+    ↓
+
+5. Build API messages
+
+    ↓
+
+6. Inject temporary prompt layers 注入临时提示曾
+
+    ↓
+
+7. API call 调用API
+
+    ↓
+
+8. Parse response 解析响应的结果
+
+    ↓
+
+    ┌──────────────┐
+    │              │
+    ▼              ▼
+tool_calls       text
+    │              │
+    ▼              ▼
+执行 Tool        返回答案
+    │
+    ▼
+tool result
+    │
+    └──────→ 再次进入 Loop
+```
+
+这就是我们今天真正要理解的 Agent Loop。
+
+#### 5. 现在回答第一个问题：用户字符串什么时候变成 Message？
+这里是非常关键的一步。Hermes 内部维护的是 OpenAI-compatible message format【兼容OpenAI消息格式】。官方文档明确说明：
+```json
+{
+  "role": "system",
+  "content": "..."
+}
+```
+以及完整的消息角色：
+```text
+system
+user
+assistant
+tool
+```
+所以，用户输入：
+```text
+你好
+```
+进入 Agent 后，并不是直接："你好"。而是直接传给模型，然后这句话被放到JSON格式报文中：
+```json
+{
+  "role": "user",
+  "content": "你好"
+}
+```
+#### 6. 这就是我们第一个基础概念：Message
+Message 是什么？
+你可以把 Message 理解成：
+> 一条带有身份信息的对话记录。
+
+比如：
+```json
+{
+  "role": "user",
+  "content": "你好"
+}
+```
+解释如下：
+```text
+role
+  ↓
+谁说的？
+
+content
+  ↓
+说了什么？
+```
+所以我们可以推测出这样的结构：
+```text
+用户说：
+{"role": "user", "content": "你好"}
+
+AI说：
+{"role": "assistant", "content": "你好！"}
+
+系统说：
+{"role": "system", "content": "You are an AI assistant."}
+```
+
+#### 7. 所以 System / User / Assistant 到底是什么？
+
+现在我们应该能看到：
+```text
+System 系统
+User 用户
+Assistant 助手
+```
+并不是三个不同的模型。也不是三个不同的 API。而是：
+```text
+Message 的 role。
+```
+
+举个例子：
+```json
+[
+  {
+    "role": "system",
+    "content": "You are Hermes."
+  },
+  {
+    "role": "user",
+    "content": "你好"
+  },
+  {
+    "role": "assistant",
+    "content": "你好，有什么可以帮你？"
+  }
+]
+```
+把这个报文中所有的message合并起来得到的整个东西：
+```text
+[
+  Message,
+  Message,
+  Message
+]
+```
+这就是conversation history，中文就是对话历史消息
+
+#### 8. 这时候 Context 就出现了
+假设用户连续说：
+```text
+User:
+你好
+
+Assistant:
+你好！
+
+User:
+我是一名 Java 程序员
+
+Assistant:
+很高兴认识你。
+
+User:
+我现在想学习 AI
+```
+那么发送给模型的可能不是最后一句：
+```text
+我现在想学习 AI
+```
+
+而是：
+```json
+[
+  {
+    "role": "system",
+    "content": "..."
+  },
+  {
+    "role": "user",
+    "content": "你好"
+  },
+  {
+    "role": "assistant",
+    "content": "你好！"
+  },
+  {
+    "role": "user",
+    "content": "我是一名 Java 程序员"
+  },
+  {
+    "role": "assistant",
+    "content": "很高兴认识你。"
+  },
+  {
+    "role": "user",
+    "content": "我现在想学习 AI"
+  }
+]
+```
+这一整个 Message 列表，就是我们现在要重点研究的 Context 的核心组成部分。
+
+#### 9. 但是事情还没完
+你可能会马上问：
+```text
+那 System Prompt 在哪里？
+```
+这正是下一层。
+Hermes 的 Agent Loop 会：
+```text
+用户输入
+    │
+    ▼
+conversation history
+    │
+    ├───────────────┐
+    │               │
+    ▼               ▼
+User Message    System Prompt
+    │               │
+    └───────┬───────┘
+            ▼
+      API Messages
+            │
+            ▼
+          LLM
+```
+
+而 System Prompt 并不是简单写死一句：
+```text
+You are an AI.
+```
+Hermes 有专门的：
+```text
+agent/prompt_builder.py
+```
+负责组装 system prompt。官方文档明确把 prompt_builder.py 定义为：
+```text
+System prompt assembly from memory, skills, context files, personality
+从记忆、技能、上下文文件和个性中组装系统提示。
+```
+也就是说，System Prompt 本身可能来自多个部分。
+参考文档：
+```text
+https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/agent-loop.md?utm_source=chatgpt.com
+```
+
+#### 10. 这就产生了一个非常重要的认知
+
+以前我们容易把：Prompt理解成：
+```text
+用户输入的问题
+```
+其实不准确。在 Agent 系统里面：
+```text
+Prompt=System Prompt+Conversation History+Current User Message+
+Tool Information+可能的额外 Context
+```
+最终才形成真正发送给模型的输入。可以画成：
+```text
+                 Prompt
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+        ▼           ▼           ▼
+     System      History      User
+     Prompt                    Message
+        │           │           │
+        └───────────┼───────────┘
+                    │
+                    ▼
+              API Messages
+                    │
+                    ▼
+                   LLM
+```
+**这个概念非常重要。**
+
+因为以后我们看到：
+```text
+Prompt Engineering  提示词工程
+Prompt Template     提示模板
+System Prompt       系统提示
+RAG Prompt          检索增强生成的提示
+Agent Prompt        代理提示
+```
+都会回到这里。
+
+#### 11. 然后就是 Context Window
+
+现在假设：
+```text
+System Prompt
+    5,000 tokens
+
+Conversation History
+   30,000 tokens
+
+User Message
+    1,000 tokens
+
+Tools
+    8,000 tokens
+```
+那么：
+```text
+总输入 ≈ 44,000 tokens
+```
+如果模型 Context Window：
+```text
+32K
+```
+就爆了，超出上限了。
+所以 Hermes 为什么需要：
+```text
+context compression
+```
+就很好理解了。它不是为了“优化代码”。而是因为：
+> LLM 每次请求能够处理的 Token 数量存在上限。
+
+官方当前实现会在模型调用前检查上下文压力，并在超过阈值时进行 compression；文档描述的默认流程包括压缩中间轮次、
+保留最近若干消息、保持 tool call/result配对等操作。
+#### 12. 现在我们终于可以回答最初的问题了
+> 一个用户输入的字符串，到底是怎么一步一步变成 LLM API 的 messages 的？
+
+当前源码结构下，可以先得到这张准确的概念地图：
+```text
+用户输入
+   │
+   │ "我想学习 AI"
+   ▼
+user_message
+   │
+   ▼
+┌─────────────────────────────┐
+│ Conversation History        │
+│                             │
+│ system                      │
+│ user                        │
+│ assistant                   │
+│ user                        │
+│ assistant                   │
+│ ...                         │
+│                             │
+│ + 当前 user message         │
+└──────────────┬──────────────┘
+               │
+               │
+               ▼
+       Context / Compression
+               │
+               ▼
+       System Prompt Builder
+               │
+               ▼
+       Prompt + Messages
+               │
+               ▼
+          API Messages
+               │
+               ▼
+             LLM
+```
+
+而 Hermes 当前的 Agent Loop 文档把第 5 步明确描述为：
+> Build API messages from conversation history
+> 根据对话历史构建 API 消息
+
 
 
 
@@ -234,6 +642,14 @@ agent/conversation_loop.py
 
 
 ## 💡 核心概念
+```text
+Prompt Engineering  提示词工程
+Prompt Template     提示模板
+System Prompt       系统提示
+RAG Prompt          检索增强生成的提示
+Agent Prompt        代理提示
+```
+
 
 ## 💻 代码实践
 
