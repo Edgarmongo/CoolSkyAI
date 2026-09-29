@@ -618,6 +618,457 @@ user_message
 > Build API messages from conversation history
 > 根据对话历史构建 API 消息
 
+不同 provider 再根据 API 类型转换：
+```text
+OpenAI Chat Completions
+        ↓
+保持 OpenAI message format
+
+Codex Responses
+        ↓
+转换成 Responses API input items
+
+Anthropic Messages
+        ↓
+通过 adapter 转换
+```
+
+#### 13. 我们今天实际上已经“倒逼”出了 5 个基础概念
+这就是我们这套学习方式的价值。没有死记硬背，我们从源码自然得到了：
+```text
+① Message
+      ↓
+{"role": "...", "content": "..."}
+
+② System / User / Assistant
+      ↓
+Message 的 role
+
+③ Conversation History
+      ↓
+多个 Message
+
+④ Prompt
+      ↓
+System + History + User + Tools + Context ...
+
+⑤ Context Window
+      ↓
+这些内容最终都会消耗 Token
+```
+然后自然就到了我们的第一个基础知识链：
+```text
+Message
+   ↓
+Prompt
+   ↓
+Context
+   ↓
+Token
+   ↓
+Context Window
+```
+
+#### 14. 但还有一个关键问题没有解决
+现在我们知道：
+```text
+api_messages
+     ↓
+LLM
+```
+但是：
+> Hermes 到底在哪里真正执行这一句？
+
+类似：
+```jupyter
+client.chat.completions.create(
+    model=...,
+    messages=...,
+    tools=...
+)
+```
+官方 agent/AGENTS.md 已经明确给出了当前 loop 的核心调用形式，并指出 API 调用是在 loop 中执行，
+然后如果模型返回 tool_calls，就执行工具、追加 tool result，再重新进入 loop。
+所以我们的下一刀就非常明确：
+```text
+conversation_loop.py
+        │
+        ▼
+turn_request_assembly.py
+        │
+        ▼
+turn_api_request.py
+        │
+        ▼
+turn_api_call.py
+        │
+        ▼
+client.chat.completions.create(...)
+```
+
+下一步我们就追这一段。这一步追通之后，我们会第一次真正看到：
+```jupyter
+messages=...
+```
+然后我会把源码中的 messages 和我们刚才画出来的：
+```text
+[
+  {"role": "system", ...},
+  {"role": "user", ...},
+  {"role": "assistant", ...}
+]
+```
+
+一一对应起来。到那时，“Prompt 到底是什么”就不再是概念，而是你亲眼看到的运行时数据结构。
+
+继续沿着 Hermes 这条真实调用链往下追一层。
+我们现在已经走到了：
+```text
+用户输入
+   ↓
+Message
+   ↓
+Conversation History
+   ↓
+Prompt / Context
+   ↓
+API Messages
+   ↓
+？？？
+```
+这里正好缺最关键的一环：
+> 下一步：追到真正的 LLM API 调用
+
+我们要回答：
+> messages 最终是怎么传给模型的？
+
+重点追这条链：
+```text
+conversation_loop.py
+        ↓
+turn_request_assembly.py
+        ↓
+turn_api_request.py
+        ↓
+turn_api_call.py
+        ↓
+LLM Provider
+        ↓
+OpenAI / Anthropic / 其他模型 API
+```
+然后我们亲眼看到类似这样的东西：
+```jupyter
+response = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    tools=tools,
+    temperature=temperature,
+    stream=True
+)
+```
+这时候我们就会一下子遇到 5 个核心概念：
+```terminaloutput
+| 源码里的东西        | 我们倒逼学习的概念                  |
+| ------------- | -------------------------- |
+| `messages`    | Message / Prompt / Context |
+| `model`       | Model / Provider           |
+| `temperature` | Temperature                |
+| `tools`       | Tool Calling               |
+| `stream`      | Streaming                  |
+
+```
+这比现在单独开一章讲 Temperature、Streaming 更有价值，因为你会看到它们为什么存在、在哪里传、最终传给谁。
+
+
+**然后再进入第二条线：tinystruct**
+
+等 Hermes 这一段追通：
+```text
+User
+ ↓
+Message
+ ↓
+Prompt
+ ↓
+Context
+ ↓
+LLM API
+```
+我们再切到 tinystruct：
+```text
+dispatcher
+   ↓
+AbstractApplication
+   ↓
+@Action
+   ↓
+Java Method
+```
+然后问一个非常有意思的问题：
+> 如果 Hermes 的 LLM 说：“我要调用一个工具”，Java 世界里的这个工具到底怎么落地？
+
+于是两条线就会开始汇合：
+```text
+                Hermes
+                  │
+                  ▼
+                 LLM
+                  │
+             Tool Calling
+                  │
+                  ▼
+              Tool Schema
+                  │
+                  ▼
+             Tool Executor
+                  │
+                  ▼
+          ┌───────────────┐
+          │ Java 世界      │
+          │               │
+          │ tinystruct    │
+          │      ↓        │
+          │   @Action     │
+          │      ↓        │
+          │ Java Method   │
+          └───────────────┘
+```
+
+这会是我们第一次真正理解：
+> AI Agent 是怎么调用 Java 业务能力的。
+
+**所以我们的学习路线暂时调整成这样**
+```text
+                 现在
+                   │
+                   ▼
+        ① Hermes Agent Loop
+                   │
+                   ▼
+        ② 真正的 LLM API Call  ← 下一步
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+      Token    Temperature  Streaming
+                   │
+                   ▼
+        ③ Tool Calling
+                   │
+                   ▼
+        ④ tinystruct @Action
+                   │
+                   ▼
+        ⑤ AI → Java Method
+                   │
+                   ▼
+        ⑥ Embedding / Vector
+                   │
+                   ▼
+        ⑦ RAG / Memory
+                   │
+                   ▼
+        ⑧ MCP
+                   │
+                   ▼
+        完整 AI Agent
+```
+直接打开 Hermes 的 turn_api_call.py，追它到底调用了哪个 Provider / Client。
+
+我们的目标不是“看懂整个文件”，而是只回答三个问题：
+> messages 是怎么传进去的？
+> 
+> model / temperature / stream 是怎么传进去的？
+> 
+> 最终是哪一个 Python 方法真正发出了 HTTP/API 请求？
+
+把这三个问题追通，我的LLM API 调用模型 就真正建立起来了。
+然后我们再回头看 tinystruct，会非常顺。
+
+现在我们已经把这条链真正追到了“发请求”的边界。
+先给你一个非常重要的结论：
+> Hermes 并不是在 conversation_loop.py 里直接写死 client.chat.completions.create(...)。
+> 当前版本已经把“组装请求”和“执行请求”进一步拆开了。
+
+这正好非常适合我们学习 AI 应用工程。
+
+### 一、先把今天的完整链路画出来
+我们现在追的是：
+```text
+
+用户输入
+   ↓
+conversation_loop.py
+   ↓
+build_api_messages()
+   ↓
+assemble_api_request()
+   ↓
+build_api_request()
+   ↓
+_build_api_kwargs()
+   ↓
+api_kwargs
+   ↓
+perform_api_call()
+   ↓
+relay_llm / transport / client
+   ↓
+LLM Provider
+```
+
+官方 Agent Loop 文档也明确把这个过程拆成：
+```text
+run_conversation()
+    ↓
+Build API messages
+    ↓
+Inject prompt layers
+    ↓
+Make API call
+    ↓
+Parse response
+```
+而且 Hermes 内部统一使用 OpenAI 风格的 Message：
+```json
+{
+  "role": "system",
+  "content": "..."
+}
+```
+```json
+{
+  "role": "user",
+  "content": "你好"
+}
+```
+```json
+{
+  "role": "assistant",
+  "content": "你好，有什么可以帮你？"
+}
+```
+工具调用时还会出现：
+```json
+{
+  "role": "assistant",
+  "tool_calls": [...]
+}
+```
+以及：
+```json
+{
+  "role": "tool",
+  "tool_call_id": "...",
+  "content": "..."
+}
+```
+
+### 二、问题 1：messages 到底是怎么传给模型的？
+#### 1. messages 不是直接拿来发送的
+
+在 turn_request_assembly.py 中：
+```text
+api_messages, effective_system = build_api_messages(
+    agent,
+    messages,
+    current_turn_user_idx=current_turn_user_idx,
+    ext_prefetch_cache=_ext_prefetch_cache,
+    plugin_user_context=_plugin_user_context,
+    moa_config=moa_config,
+    active_system_prompt=active_system_prompt,
+)
+```
+也就是说：
+```text
+messages
+   ↓
+build_api_messages()
+   ↓
+api_messages
+```
+注意这里出现了一个非常值得你记住的概念：
+> messages ≠ api_messages
+
+#### 2. 为什么要复制一份？
+因为 Hermes 的：
+```text
+messages
+```
+更像是：
+> Agent 内部维护的会话状态
+
+而：
+```text
+api_messages
+```
+更像是：
+
+准备发送给模型的 Wire Payload
+
+也就是：
+```text
+内部状态
+↓
+转换 / 清理 / 压缩 / 修改
+↓
+API 请求数据
+```
+
+
+这个设计非常像 Java 后端：
+```text
+Entity
+↓
+Service
+↓
+DTO
+↓
+HTTP Request
+```
+
+
+你可以直接把它理解成：
+```text
+Agent Message
+↓
+API Message
+↓
+HTTP Request
+```
+
+
+这就是我们以后写 AI Java 应用时非常重要的一个工程思想。
+
+
+### 三、api_messages 还会经历什么？
+这里就开始有意思了。
+Hermes 并不是：
+```text
+api_messages = messages
+client.send(api_messages)
+```
+
+而是继续进行大量处理。例如：
+```text
+api_messages = agent._sanitize_api_messages(api_messages)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -650,6 +1101,16 @@ RAG Prompt          检索增强生成的提示
 Agent Prompt        代理提示
 ```
 
+```terminaloutput
+| 源码里的东西        | 我们倒逼学习的概念                  |
+| ------------- | -------------------------- |
+| `messages`    | Message / Prompt / Context |
+| `model`       | Model / Provider           |
+| `temperature` | Temperature                |
+| `tools`       | Tool Calling               |
+| `stream`      | Streaming                  |
+
+```
 
 ## 💻 代码实践
 
